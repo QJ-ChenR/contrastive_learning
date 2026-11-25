@@ -377,6 +377,24 @@ def load_encoder(settings: dict) -> DNAEncoder:
     files = weight_files(path)
     tokenizer_path = Path(settings.get("tokenizer_path") or path).expanduser().resolve()
     config_path = Path(settings.get("config_path") or path).expanduser().resolve()
+    config_file = config_path if (config_path.is_file() or config_path.suffix.lower() == ".json") else config_path / "config.json"
+    config_hint = (
+        "Set --config-path to the original ModernBERT configuration file or its directory. "
+        "A null config_path in the training JSON reads config.json from the checkpoint directory. "
+        "Do not add guessed architecture fields to the pretrained model."
+    )
+    if not config_file.is_file():
+        raise FileNotFoundError(f"Original model config not found: {config_file}. {config_hint}")
+    try:
+        config_data = json.loads(config_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Invalid JSON in original model config: {config_file}. {config_hint}") from error
+    if not isinstance(config_data, dict) or config_data.get("model_type") != "modernbert":
+        actual = config_data.get("model_type") if isinstance(config_data, dict) else "not a JSON object"
+        raise ValueError(
+            f"Original model config {config_file} must declare model_type='modernbert'; "
+            f"found {actual!r}. {config_hint}"
+        )
     config = AutoConfig.from_pretrained(str(config_path), local_files_only=True, trust_remote_code=False)
     if config.model_type != "modernbert":
         raise ValueError("Checkpoint model_type must be modernbert")
@@ -402,7 +420,6 @@ def load_encoder(settings: dict) -> DNAEncoder:
     for name, parameter in loaded.named_parameters():
         if not torch.isfinite(parameter).all():
             raise ValueError(f"Non-finite checkpoint parameter: {name}")
-    config_file = config_path / "config.json" if config_path.is_dir() else config_path
     tokenizer_files = [file for file in (
         tokenizer_path / "tokenizer.json", tokenizer_path / "tokenizer_config.json",
         tokenizer_path / "special_tokens_map.json", tokenizer_path / "added_tokens.json",

@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 
 HAS_MODEL_DEPS = all(importlib.util.find_spec(name) is not None for name in (
@@ -228,6 +229,42 @@ class TrainingModelTests(unittest.TestCase):
             save_file(state, str(weight_file), metadata={"format": "pt"})
             with self.assertRaisesRegex(ValueError, "strictly match"):
                 load_encoder(self.settings(checkpoint=str(destination)))
+
+    def test_null_config_path_uses_checkpoint_not_tokenizer_parent(self):
+        from dna_training.model import load_encoder
+
+        with tempfile.TemporaryDirectory(prefix="dna-split-model-layout-") as temp:
+            parent = Path(temp)
+            checkpoint = parent / "checkpoint-13920"
+            shutil.copytree(self.checkpoint, checkpoint)
+            for name in ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"):
+                if (self.checkpoint / name).is_file():
+                    shutil.copy2(self.checkpoint / name, parent / name)
+            # The parent contains the tokenizer but no model config, as can
+            # happen with Trainer checkpoint directories on the server.
+            encoder = load_encoder(self.settings(checkpoint=str(checkpoint), tokenizer_path=str(parent),
+                                                  config_path=None))
+            self.assertEqual(encoder.metadata["config_path"], str(checkpoint / "config.json"))
+            self.assertEqual(encoder.metadata["tokenizer_path"], str(parent))
+            self.assertFalse((parent / "config.json").exists())
+
+    def test_missing_or_invalid_original_config_fails_before_loading_weights(self):
+        from dna_training.model import load_encoder
+
+        with tempfile.TemporaryDirectory(prefix="dna-bad-config-") as temp:
+            directory = Path(temp)
+            config_file = directory / "config.json"
+            with mock.patch("transformers.ModernBertForMaskedLM.from_pretrained") as weights:
+                with self.assertRaisesRegex(FileNotFoundError, "Original model config not found") as failure:
+                    load_encoder(self.settings(config_path=str(directory)))
+                self.assertIn(str(config_file), str(failure.exception))
+                self.assertIn("--config-path", str(failure.exception))
+                for contents in ("{}", '{"model_type": "bert"}', "[]", "{invalid"):
+                    config_file.write_text(contents)
+                    with self.subTest(contents=contents), self.assertRaisesRegex(ValueError, "model config"):
+                        load_encoder(self.settings(config_path=str(directory)))
+                    self.assertEqual(config_file.read_text(), contents)
+                weights.assert_not_called()
 
     def test_vocab_pad_and_nonexistent_lora_target_are_fatal(self):
         from dna_training.model import load_encoder
