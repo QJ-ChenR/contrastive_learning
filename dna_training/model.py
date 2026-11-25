@@ -398,11 +398,24 @@ def load_encoder(settings: dict) -> DNAEncoder:
     config = AutoConfig.from_pretrained(str(config_path), local_files_only=True, trust_remote_code=False)
     if config.model_type != "modernbert":
         raise ValueError("Checkpoint model_type must be modernbert")
+    tokenizer_file = tokenizer_path / "tokenizer.json"
+    if not tokenizer_file.is_file():
+        raise FileNotFoundError(
+            f"Original fast DNA tokenizer not found: {tokenizer_file}. "
+            "Set --tokenizer-path to the directory containing the pretrained tokenizer.json "
+            "and tokenizer_config.json, or use a null tokenizer_path in the training JSON "
+            "to read them from the checkpoint directory. Installing sentencepiece/tiktoken "
+            "does not replace the original DNA tokenizer."
+        )
     # The pinned Transformers 5.1 implementation has no implicit torch.compile
     # path. Its legacy reference_compile option is deprecated and unused.
-    tokenizer = AutoTokenizer.from_pretrained(
-        str(tokenizer_path), local_files_only=True, trust_remote_code=False, use_fast=True,
-    )
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            str(tokenizer_path), local_files_only=True, trust_remote_code=False, use_fast=True,
+        )
+    except Exception as error:
+        error.add_note(f"Loading original DNA tokenizer from {tokenizer_path}; no replacement tokenizer was constructed")
+        raise
     if not getattr(tokenizer, "is_fast", False):
         raise ValueError("A fast tokenizer with exact DNA offsets is required")
     if config.pad_token_id != tokenizer.pad_token_id:

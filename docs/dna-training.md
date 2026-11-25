@@ -107,12 +107,14 @@ python -c "import flash_attn; print(flash_attn.__version__)"
 | 配置项 | 含义 |
 | --- | --- |
 | `checkpoint` | 包含真实预训练 MLM 权重的本地 checkpoint 目录 |
-| `tokenizer_path` | 原始 DNA tokenizer 文件所在目录 |
+| `tokenizer_path` | 默认为 `null`，读取权重目录内的原始 `tokenizer.json` 和 `tokenizer_config.json`；分词器另存时才指定其目录 |
 | `config_path` | 默认为 `null`，读取 `checkpoint/config.json`；配置另存时才指定原始配置文件或所在目录 |
 
-示例配置的权重目录是 `/home/s252613/BGC_encoder/BGC_annotation/BGC_transformer/checkpoint-13920`，tokenizer 目录是其父目录；模型配置默认从权重目录内读取。此前显式把 `config_path` 指向父目录的服务器探测，在配置识别阶段失败，尚未进入 DNA 前向／反向。现已移除这个父目录配置假设；服务器上 checkpoint 内原始 `config.json` 是否齐全仍需核实，也可用 `--config-path` 指定原始配置实际所在位置。
+示例配置的权重目录是 `/home/s252613/BGC_encoder/BGC_annotation/BGC_transformer/checkpoint-13920`，模型配置和 tokenizer 默认都从该权重目录读取。服务器文件清单已确认原始 `tokenizer.json`（286487 字节）和 `tokenizer_config.json`（270 字节）在该目录内。此前把 `config_path`、`tokenizer_path` 指向父目录，分别造成配置识别和 tokenizer backend 初始化失败，均未进入 DNA 前向／反向；示例已移除这两个父目录假设。其他 checkpoint 若将配置或分词器另存，可分别用 `--config-path` 和 `--tokenizer-path` 指定原始文件位置。
 
 若报 `Original model config not found` 或缺少 `model_type='modernbert'`，先检查报错指向的原配置位置，不要给一个错误文件补字段来猜模型结构。加载器会在加载模型张量之前终止；这种配置错误不是 CUDA 显存溢出。重新探测应使用新的 `--report-dir`，保留前一次失败记录。
+
+若报 `Original fast DNA tokenizer not found`，检查 `tokenizer_path` 是否选中了包含原始 `tokenizer.json` 的目录。Transformers 的通用 backend 初始化错误可能建议安装 `sentencepiece` 或 `tiktoken`，但这不能补回缺失的原始 DNA BPE 词表及合并规则。不要重新训练或替换为通用 ModernBERT 分词器。加载器会保留原始文件，只在内存中加载并核对词表与特殊 token。
 
 模型仅从本地加载，不会因缺权重而自动下载或随机初始化。完整 MLM 权重加载不匹配、缺分片、词表/PAD 不一致或 LoRA 目标不存在都会终止。CLS/SEP 等过时的配置元数据会根据已核验的原 tokenizer 修正，并记录修正内容；不改变词表或扩展 embedding。
 

@@ -2,7 +2,7 @@
   "split_dir": "data/processed/dna_homology_split_v1",
   "matrix_path": "data/raw/BGC-clustering-benchmark/tanimoto_results/NPAtlas_bm_v1.tsv",
   "checkpoint": "/home/s252613/BGC_encoder/BGC_annotation/BGC_transformer/checkpoint-13920",
-  "tokenizer_path": "/home/s252613/BGC_encoder/BGC_annotation/BGC_transformer",
+  "tokenizer_path": null,
   "config_path": null,
   "mode": "head",
   "seed": 42,

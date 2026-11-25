@@ -248,6 +248,43 @@ class TrainingModelTests(unittest.TestCase):
             self.assertEqual(encoder.metadata["tokenizer_path"], str(parent))
             self.assertFalse((parent / "config.json").exists())
 
+    def test_server_example_loads_both_config_and_tokenizer_from_checkpoint(self):
+        from dna_training.config import PROJECT_ROOT, load_config
+        from dna_training.model import load_encoder
+
+        with tempfile.TemporaryDirectory(prefix="dna-server-model-layout-") as temp:
+            parent = Path(temp)
+            checkpoint = parent / "checkpoint-13920"
+            shutil.copytree(self.checkpoint, checkpoint)
+            config = load_config(PROJECT_ROOT / "configs/dna_margin_mse.json", {
+                "checkpoint": str(checkpoint), "device": "cpu", "dtype": "float32",
+                "attention_backend": "eager", "mode": "frozen",
+            })
+            encoder = load_encoder(config.model_settings())
+            self.assertEqual(encoder.metadata["config_path"], str(checkpoint / "config.json"))
+            self.assertEqual(encoder.metadata["tokenizer_path"], str(checkpoint))
+            self.assertEqual(encoder.tokenize("ACGTN")[0], [5, 6, 7, 8, 0])
+            self.assertFalse((parent / "tokenizer.json").exists())
+
+    def test_wrong_tokenizer_directory_fails_before_backend_or_weights_load(self):
+        from dna_training.model import load_encoder
+
+        with tempfile.TemporaryDirectory(prefix="dna-missing-tokenizer-") as temp:
+            parent = Path(temp)
+            with mock.patch("transformers.ModernBertForMaskedLM.from_pretrained") as weights, \
+                    mock.patch("transformers.AutoTokenizer.from_pretrained") as backend:
+                for has_metadata in (False, True):
+                    if has_metadata:
+                        shutil.copy2(self.checkpoint / "tokenizer_config.json", parent / "tokenizer_config.json")
+                    with self.subTest(has_metadata=has_metadata), self.assertRaisesRegex(
+                        FileNotFoundError, "Original fast DNA tokenizer not found"
+                    ) as failure:
+                        load_encoder(self.settings(tokenizer_path=str(parent)))
+                    self.assertIn(str(parent / "tokenizer.json"), str(failure.exception))
+                    self.assertIn("--tokenizer-path", str(failure.exception))
+                weights.assert_not_called()
+                backend.assert_not_called()
+
     def test_missing_or_invalid_original_config_fails_before_loading_weights(self):
         from dna_training.model import load_encoder
 
