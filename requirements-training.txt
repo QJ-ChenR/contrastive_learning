@@ -1,0 +1,8 @@
+# Install a CUDA-compatible torch 2.10.0 build on the server first.
+# CPU integration tests use torch 2.10.0+cpu. FA2 is installed separately for
+# the server's CUDA/PyTorch toolchain; it is not needed by head-only cache tests.
+torch==2.10.0
+transformers==5.1.0
+peft==0.18.1
+biopython==1.88
+numpy==2.5.3
