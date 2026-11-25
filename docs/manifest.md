@@ -6,7 +6,7 @@
 
 ## 生成与验证
 
-依赖为 NumPy 和 Biopython，本次版本记录在 `requirements-manifest.txt` 和快照 `provenance.json`。无需 PyTorch、模型权重、RDKit 或联网。
+依赖为 NumPy 和 Biopython，无需 PyTorch、模型权重、RDKit 或联网。项目依赖现已合并到 [`requirements.txt`](../requirements.txt)；仅做清单处理可单独安装 `numpy==2.2.4 biopython==1.85`。历史快照的实际生成版本仍记录在其 `provenance.json`，不能用当前服务器依赖覆盖这份来源记录。
 
 在项目根目录运行；当前本地可用解释器为 `/home/qiju/miniforge3/envs/BGC/bin/python`：
 

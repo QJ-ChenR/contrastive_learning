@@ -11,6 +11,8 @@ from contextlib import nullcontext
 from hashlib import sha256
 import json
 from pathlib import Path
+import shlex
+import sys
 from typing import Any
 
 import torch
@@ -358,6 +360,24 @@ def load_encoder(settings: dict) -> DNAEncoder:
     mode = settings.get("mode", "lora")
     if mode not in {"frozen", "head", "lora"}:
         raise ValueError("mode must be frozen, head or lora")
+    if mode == "lora":
+        # Fail before reading or allocating the pretrained model. Keep the
+        # original import error so dependency/ABI failures are not mislabeled
+        # as an absent PEFT package.
+        try:
+            import peft
+        except Exception as error:
+            reason = (
+                "PEFT package not found in this Python environment."
+                if isinstance(error, ModuleNotFoundError) and error.name == "peft"
+                else "PEFT could not be imported; inspect the original dependency/compatibility error."
+            )
+            install = shlex.join([
+                sys.executable, "-m", "pip", "install", "-r",
+                str(Path(__file__).resolve().parents[1] / "requirements.txt"),
+            ])
+            error.add_note(f"LoRA requires PEFT. {reason} Install the server requirements with: {install}")
+            raise
     dtype_name = settings.get("dtype", "float32")
     if dtype_name not in {"float32", "bfloat16"}:
         raise ValueError("dtype must be float32 or bfloat16")
@@ -452,6 +472,5 @@ def load_encoder(settings: dict) -> DNAEncoder:
         "transformers_version": transformers.__version__,
     }
     if mode == "lora":
-        import peft
         provenance["peft_version"] = peft.__version__
     return DNAEncoder(loaded.model, tokenizer, settings, provenance)

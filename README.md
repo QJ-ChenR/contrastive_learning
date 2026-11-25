@@ -6,6 +6,8 @@
 
 **当前状态：已完成 DNA 近同源分组、按 BGC／组划分及连续差值监督训练脚本；尚未在真实服务器 checkpoint 上训练。** 最新入口：[训练与服务器运行指南](docs/dna-training.md)、[划分结果](data/processed/dna_homology_split_v1/summary.md)、[分组规则与复现](docs/homology-split.md)。原始数据、[初始清单快照](data/processed/benchmark_manifest_v1/summary.md)及全部产物关系保留。
 
+服务器依赖已统一为 [requirements.txt](requirements.txt)，对应已确认的 Python 3.11 / PyTorch 2.6 nightly / CUDA 12.4 / L40S 环境，补入 PEFT 0.18.1。安装、版本依据与 GPU 检查见[环境指南](docs/server-environment.md)。
+
 2026-11-25 完成的固定划分使用 `seed=42`、目标比例 `80/10/10`。1343 个有 DNA 的候选与 421 个 B/E/G/H 记录联合建图；在明确的 DNA 一致性／覆盖规则下隔离 208 个候选（比此前精确重合审计增加 24 个），其余 1135 个 BGC、1068 个组进入划分：
 
 | 集合 | BGC | 同源组 | 集合内 S > 0.65 正对 | 有集合内正邻居的 BGC |

@@ -62,7 +62,7 @@ L(i,j,k)=\left[(c_{ij}-c_{ik})-(S_{ij}-S_{ik})\right]^2.
 
 ## 3. 服务器准备
 
-已确认硬件型号为 **L40S 48 GB**；卡数尚未确认，本脚本按单进程、单 GPU 工作，没有 DDP 训练入口。若服务器有多张 GPU，可在启动前用 `CUDA_VISIBLE_DEVICES` 选择一张，恢复运行时保持相同可见 GPU 配置。
+已确认硬件型号为 **L40S 48 GB**，驱动 `580.82.07`；本脚本按单进程、单 GPU 工作，没有 DDP 训练入口。若服务器有多张 GPU，可在启动前用 `CUDA_VISIBLE_DEVICES` 选择一张，恢复运行时保持相同可见 GPU 配置。
 
 将项目代码及以下已有数据目录复制到服务器，保持项目内相对路径：
 
@@ -71,7 +71,7 @@ contrastive_learning/
 ├── configs/dna_margin_mse.json
 ├── dna_training/
 ├── scripts/
-├── requirements-training.txt
+├── requirements.txt
 └── data/
     ├── raw/BGC-clustering-benchmark/
     │   ├── benchmark_bgc/
@@ -81,26 +81,19 @@ contrastive_learning/
 
 建议复制原始 benchmark 目录和完整划分快照，不重新下载一个可能变化的版本。`data/` 被 Git 忽略，只有克隆代码不会得到这些输入。训练不需要在服务器重跑 BLAST 同源搜索，也不依赖本机旧绝对路径下的比对临时文件。以下命令均在服务器项目根目录运行；从其他目录启动时也可使用脚本绝对路径，并通过 `--project-root` 指定项目根。
 
-使用 Python 3.12 环境，例如：
+服务器实际环境是 **Python 3.11.11、PyTorch 2.6.0.dev20241112／CUDA 12.4、FlashAttention 2.8.3.post2**。保留这组 GPU 二进制，使用统一的 [`requirements.txt`](../requirements.txt) 补齐依赖。完整版本表、环境备份／克隆方法、安装计划核对、导入检查及 BF16 内核验证见 **[服务器环境指南](server-environment.md)**。
+
+在已有环境或其 Conda 克隆中执行：
 
 ```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
+# 若使用克隆环境，改为 conda activate dna_training。
+conda activate natural_product
+python -m pip install --dry-run -r requirements.txt
+python -m pip install -r requirements.txt
+python -m pip check
 ```
 
-先根据服务器驱动和 CUDA 环境，按 [PyTorch 官方历史版本安装说明](https://pytorch.org/get-started/previous-versions/) 安装 **torch 2.10.0 的 CUDA 构建**。本指南不预设服务器 CUDA 版本，也不将本地 CPU 测试用的 wheel 当作服务器安装包。随后安装固定 Python 依赖：
-
-```bash
-python -m pip install -r requirements-training.txt
-```
-
-依赖文件固定 `transformers==5.1.0`、`peft==0.18.1`、`biopython==1.88` 和 `numpy==2.5.3`。FlashAttention 2 需要单独按照 [上游安装说明](https://github.com/Dao-AILab/flash-attention#installation-and-features) 配置与当前 PyTorch/CUDA 匹配的包及编译工具链；它不包含在该 requirements 文件内。完成后检查实际环境：
-
-```bash
-python -c "import torch, transformers, peft; print(torch.__version__, torch.version.cuda, torch.cuda.is_available()); print(transformers.__version__, peft.__version__)"
-python -c "import flash_attn; print(flash_attn.__version__)"
-```
+缺失的 LoRA 库固定为 `peft==0.18.1`；现有 Transformers 5.1.0、Tokenizers 0.22.2、Accelerate 1.5.2、NumPy 2.2.4 和 Biopython 1.85 保留。此文件面向已有服务器环境，不是从空环境重建旧 nightly 的安装器；若 pip 准备替换／编译 PyTorch 或 FlashAttention，先核对解释器。不要使用旧指南中的 PyTorch 2.10 / Python 3.12 本地测试组合。包导入和小型 GPU 内核检查通过后再进行完整 DNA 探测。
 
 正式运行前，修改配置中的三个模型路径：
 
@@ -127,7 +120,7 @@ python scripts/train_dna_encoder.py audit \
   --report runs/dna_training_audit.json
 ```
 
-`audit` 不加载模型、不要求 checkpoint 或 GPU；安装 `requirements-manifest.txt` 中的 NumPy/Biopython 也可执行。报告包括划分计数、训练 DNA 验证、完整 DNA 长度统计、采样协议及第 0 轮分差摘要。它只核验训练 DNA 的实际文件内容；验证/测试 DNA 会在各自需要编码时核验。审计通过不能替代模型资源验证。
+`audit` 不加载模型、不要求 checkpoint 或 GPU；单独安装 `numpy==2.2.4 biopython==1.85` 也可执行，版本与统一 [`requirements.txt`](../requirements.txt) 对齐。报告包括划分计数、训练 DNA 验证、完整 DNA 长度统计、采样协议及第 0 轮分差摘要。它只核验训练 DNA 的实际文件内容；验证/测试 DNA 会在各自需要编码时核验。审计通过不能替代模型资源验证。
 
 ### 4.2 在真实 GPU 上做 LoRA 资源探测
 

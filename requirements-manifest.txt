@@ -1,3 +1,0 @@
-# Versions used to build and validate benchmark_manifest_v1.
-biopython==1.88
-numpy==2.5.3

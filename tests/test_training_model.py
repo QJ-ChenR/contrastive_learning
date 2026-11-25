@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import importlib.util
+import builtins
 import json
 from pathlib import Path
 import shutil
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -62,6 +64,67 @@ class TrainingModelTests(unittest.TestCase):
             "lora_dropout": 0.0, "gradient_checkpointing": True,
             **overrides,
         }
+
+    def test_missing_peft_fails_before_loading_checkpoint(self):
+        from dna_training.model import load_encoder
+
+        original_import = builtins.__import__
+        missing = ModuleNotFoundError("No module named 'peft'", name="peft")
+
+        def import_without_peft(name, *args, **kwargs):
+            if name == "peft":
+                raise missing
+            return original_import(name, *args, **kwargs)
+
+        with mock.patch("transformers.ModernBertForMaskedLM.from_pretrained") as weights, \
+                mock.patch("builtins.__import__", side_effect=import_without_peft):
+            with self.assertRaises(ModuleNotFoundError) as context:
+                load_encoder(self.settings(mode="lora"))
+        self.assertIs(context.exception, missing)
+        self.assertIn("PEFT package not found", " ".join(missing.__notes__))
+        self.assertIn(sys.executable, " ".join(missing.__notes__))
+        self.assertIn("-m pip install -r", " ".join(missing.__notes__))
+        self.assertIn("requirements.txt", " ".join(missing.__notes__))
+        weights.assert_not_called()
+
+    def test_broken_peft_dependency_keeps_original_error(self):
+        from dna_training.model import load_encoder
+
+        original_import = builtins.__import__
+        for failure in (
+            ModuleNotFoundError("No module named 'accelerate.missing'", name="accelerate.missing"),
+            ImportError("cannot import name 'unsupported_api' from 'torch'"),
+        ):
+            def import_with_broken_peft(name, *args, **kwargs):
+                if name == "peft":
+                    raise failure
+                return original_import(name, *args, **kwargs)
+
+            with self.subTest(failure=str(failure)), \
+                    mock.patch("transformers.ModernBertForMaskedLM.from_pretrained") as weights, \
+                    mock.patch("builtins.__import__", side_effect=import_with_broken_peft):
+                with self.assertRaises(type(failure)) as context:
+                    load_encoder(self.settings(mode="lora"))
+                self.assertIs(context.exception, failure)
+                self.assertIn("PEFT could not be imported", " ".join(failure.__notes__))
+                self.assertNotIn("PEFT package not found", " ".join(failure.__notes__))
+                weights.assert_not_called()
+
+    def test_frozen_and_head_do_not_import_peft(self):
+        from dna_training.model import load_encoder
+
+        original_import = builtins.__import__
+
+        def import_without_peft(name, *args, **kwargs):
+            if name == "peft" or name.startswith("peft."):
+                raise ModuleNotFoundError("No module named 'peft'", name="peft")
+            return original_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=import_without_peft):
+            for mode in ("frozen", "head"):
+                with self.subTest(mode=mode):
+                    encoder = load_encoder(self.settings(mode=mode))
+                    self.assertEqual(encoder.mode, mode)
 
     def test_full_input_pooling_retains_unk_and_excludes_specials(self):
         import torch

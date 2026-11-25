@@ -87,7 +87,7 @@ word11 补充覆盖的查询范围不均匀，也不是第二次完整搜索。�
 
 ## 复现与验证
 
-需要 Python、NumPy、Biopython，以及同一 BLAST+ 安装目录下的 `blastn` 和 `makeblastdb`。Python 清单依赖见 [`requirements-manifest.txt`](../requirements-manifest.txt)；BLAST+ 实际版本与二进制 SHA256 保存在搜索快照。以下本地路径可替换为服务器路径，输出目录必须尚不存在：
+需要 Python、NumPy、Biopython，以及同一 BLAST+ 安装目录下的 `blastn` 和 `makeblastdb`。Python 依赖统一见 [`requirements.txt`](../requirements.txt)；仅做数据处理可单独安装 `numpy==2.2.4 biopython==1.85`，无需 GPU 训练依赖。BLAST+ 实际版本与二进制 SHA256 保存在搜索快照。以下本地路径可替换为服务器路径，输出目录必须尚不存在：
 
 ```bash
 /home/qiju/miniforge3/envs/BGC/bin/python -B scripts/run_dna_homology.py \
