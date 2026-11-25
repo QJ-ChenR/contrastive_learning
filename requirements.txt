@@ -46,6 +46,9 @@ biopython==1.85
 # resolved environment after installation for experiment provenance.
 # Transformers 5.1.0 requires Hub >=1.3,<2 (the old Hub 0.30.1 is insufficient).
 huggingface-hub>=1.3.0,<2.0
+# The cloned server environment also contains httpx2 2.15.1, which requires
+# idna>=3.18. Keep Requests 2.32.3's <4 bound too. This does not install httpx2.
+idna>=3.18,<4
 safetensors>=0.4.3
 packaging>=20.0
 psutil

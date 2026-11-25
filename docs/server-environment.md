@@ -68,6 +68,22 @@ PyTorch、FlashAttention 和已匹配的核心包应显示 `Requirement already 
 
 如果提示找不到 `torch==2.6.0.dev20241112`，通常说明当前环境没有这份历史 Conda 安装。该 nightly 不保证仍能从当前 PyPI 下载；应回到已有环境，或克隆它。不要删掉版本约束后让 pip 自动升级 PyTorch。`pip check` 检查的是整个环境；若已有其他项目的冲突，保留具体输出后处理，不要通过批量升级隐藏它。
 
+### 已确认的 HTTPX2 / IDNA 冲突
+
+用户在克隆并安装后的环境中报告：`httpx2 2.15.1 has requirement idna>=3.18, but you have idna 3.10`。这条信息说明 IDNA 版本低于 HTTPX2 的要求；仅凭它不能判断 HTTPX2 是克隆时已有，还是后续安装引入。本地 CPU 测试环境没有 HTTPX2，因此之前的 `pip check` 未覆盖这项冲突。
+
+统一 requirements 已增加 `idna>=3.18,<4`：下界满足 [HTTPX2 2.15.1 的元数据](https://pypi.org/pypi/httpx2/2.15.1/json)，上界兼容历史环境中 [Requests 2.32.3 的要求](https://github.com/psf/requests/blob/v2.32.3/setup.py#L55-L60)。[IDNA 3.18](https://pypi.org/project/idna/3.18/) 支持 Python 3.11，没有额外的常规运行依赖；此修复不要求更换 PyTorch、CUDA 或 FlashAttention，也不额外安装 HTTPX2。
+
+已经安装过其他训练依赖时，只需在克隆环境执行：
+
+```bash
+conda activate dna_training
+python -m pip install "idna>=3.18,<4"
+python -m pip check
+```
+
+若最后显示 `No broken requirements found.`，再继续下方导入／GPU 检查和 probe；若仍有冲突，应根据完整输出逐项处理。这里的包更新只作用于激活的克隆环境，原 `natural_product` 继续供旧项目使用。
+
 ## 3. 验证解释器、包版本和 GPU
 
 下面先检查每条 requirements 约束，再实际导入模型依赖和 CUDA 扩展。它不读取或修改原 checkpoint。
