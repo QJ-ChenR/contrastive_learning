@@ -34,7 +34,8 @@ class TrainingConfigurationTests(unittest.TestCase):
             output = Path(temporary) / "run"
             output.mkdir()
             config = TrainingConfig(device="cpu", dtype="float32", attention_backend="eager", mode="lora",
-                                    seed=77, max_epochs=11, output_dir=str(output))
+                                    seed=77, max_epochs=11, output_dir=str(output), gradient_replay=False,
+                                    gradient_checkpointing=True, checkpoint_token_budget=30000)
             (output / "config.json").write_text(json.dumps(config.to_dict()))
             with mock.patch("dna_training.runtime.train", return_value={}) as train, redirect_stdout(io.StringIO()):
                 main(["train", "--resume", "--output-dir", str(output), "--device", "cpu"])
@@ -42,6 +43,27 @@ class TrainingConfigurationTests(unittest.TestCase):
             self.assertTrue(resume)
             self.assertEqual((restored.mode, restored.seed, restored.max_epochs, restored.dtype),
                              ("lora", 77, 11, "float32"))
+            self.assertFalse(restored.gradient_replay)
+            self.assertTrue(restored.gradient_checkpointing)
+            self.assertEqual(restored.checkpoint_token_budget, 30000)
+
+    def test_resource_flags_override_only_when_explicit_for_train_and_probe(self):
+        for command, extra, target in (("train", [], "train"),
+                                       ("probe", ["--report-dir", "/unused/probe"], "probe")):
+            for replay, checkpointing in ((False, True), (True, False)):
+                flags = ["--gradient-replay" if replay else "--no-gradient-replay",
+                         "--gradient-checkpointing" if checkpointing else "--no-gradient-checkpointing",
+                         "--checkpoint-token-budget", "30000"]
+                with self.subTest(command=command, replay=replay, checkpointing=checkpointing), \
+                        mock.patch(f"dna_training.runtime.{target}", return_value={}) as execute, \
+                        redirect_stdout(io.StringIO()):
+                    main([command, *extra, *flags])
+                    config = execute.call_args.args[0]
+                    self.assertEqual(config.gradient_replay, replay)
+                    self.assertEqual(config.gradient_checkpointing, checkpointing)
+                    self.assertEqual(config.checkpoint_token_budget, 30000)
+        with self.assertRaisesRegex(ValueError, "checkpoint_token_budget"):
+            main(["probe", "--report-dir", "/unused/probe", "--checkpoint-token-budget", "-1"])
 
     def test_evaluation_cannot_change_selection_protocol(self):
         with self.assertRaisesRegex(ValueError, "saved training or metric protocol"):

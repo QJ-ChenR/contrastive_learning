@@ -253,6 +253,64 @@ class TrainingRuntimeTests(unittest.TestCase):
         self.assertEqual(before, {path.name: sha256(path) for path in self.checkpoint.iterdir() if path.is_file()})
         self.assertFalse(config.path("output_dir").exists())
 
+    def test_fast_lora_matches_original_updates_and_reuses_selected_validation(self):
+        import torch
+
+        original = self.config("lora", "original", max_epochs=1)
+        fast = self.config("lora", "fast", max_epochs=1, gradient_replay=False, checkpoint_token_budget=30000)
+        self.quiet(runtime.train, original)
+        with mock.patch.object(runtime, "encode_ids", wraps=runtime.encode_ids) as encoding:
+            summary = self.quiet(runtime.train, fast)
+        # Initial validation plus one epoch; export must not encode again.
+        self.assertEqual(encoding.call_count, 4)
+        self.assertTrue(summary["reused_best_validation"])
+        left = runtime.load_state(original.path("output_dir") / "last.pt")
+        right = runtime.load_state(fast.path("output_dir") / "last.pt")
+        for kind in ("adapters", "head"):
+            for name, tensor in left["model"][kind].items():
+                torch.testing.assert_close(tensor, right["model"][kind][name], atol=2e-6, rtol=2e-5)
+        self.assert_nested_equal(left["rng"], right["rng"])
+        self.assertAlmostEqual(left["history"][-1]["train_loss"], right["history"][-1]["train_loss"], places=6)
+        self.assertEqual(right["history"][-1]["checkpointed_triplets"], 0)
+        self.assertEqual(left["history"][-1]["checkpointed_triplets"], 4)
+        for field in ("training_seconds", "validation_seconds", "mean_update_seconds", "training_triplets_per_second"):
+            self.assertGreater(right["history"][-1][field], 0)
+        # The cached best export equals an explicit independent recomputation.
+        self.quiet(runtime.evaluate_run, fast.path("output_dir"), "validation")
+        with np.load(fast.path("output_dir") / "validation/embeddings.npz") as cached:
+            with np.load(fast.path("output_dir") / "evaluation_validation/embeddings.npz") as recomputed:
+                for key in cached.files:
+                    np.testing.assert_array_equal(cached[key], recomputed[key])
+
+    def test_selected_validation_cache_rejects_other_weights_epoch_or_embeddings(self):
+        config = self.config("lora", "cache_identity", max_epochs=1)
+        self.quiet(runtime.train, config)
+        selected = runtime.load_state(config.path("output_dir") / "best.pt")
+        for field in ("epoch", "weights", "embeddings", "ids", "signature"):
+            changed = copy.deepcopy(selected)
+            if field == "epoch":
+                changed["best_validation"]["epoch"] += 1
+            elif field == "weights":
+                next(iter(changed["model"]["head"].values())).add_(0.1)
+            elif field == "embeddings":
+                changed["best_validation"]["gallery_embeddings"][0, 0] += 0.1
+            elif field == "ids":
+                changed["best_validation"]["gallery_ids"].reverse()
+            else:
+                changed["best_validation"]["signature_sha256"] = "changed"
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "validation cache"):
+                runtime._export_selected_validation(changed, self.cohort, config.eval_k, self.root / "bad_export")
+        self.assertFalse((self.root / "bad_export").exists())
+        with self.assertRaisesRegex(ValueError, "validation cache"):
+            runtime._export_selected_validation(selected, self.cohort, config.eval_k + 1, self.root / "bad_export")
+        changed_cohort = copy.copy(self.cohort)
+        changed_cohort.fingerprint = {**self.cohort.fingerprint, "matrix_sha256": "changed"}
+        with self.assertRaisesRegex(ValueError, "validation cache"):
+            runtime._export_selected_validation(selected, changed_cohort, config.eval_k, self.root / "bad_export")
+        selected.pop("best_validation")
+        self.assertIsNone(runtime._export_selected_validation(selected, self.cohort, config.eval_k,
+                                                             self.root / "legacy"))
+
     def test_existing_output_and_changed_resume_config_are_rejected_without_overwriting_model(self):
         config = self.config("head", "run")
         self.quiet(runtime.train, config, stop_after_epochs=1)

@@ -2,7 +2,7 @@
 
 本轮实现以已有 ModernBERT DNA encoder 为起点，使用化学相似度的**差值回归（Margin-MSE）**训练 BGC 向量。输入保持完整 DNA，推理时每个 BGC 独立得到一个向量。运行入口为 [`scripts/train_dna_encoder.py`](../scripts/train_dna_encoder.py)，首轮配置为 [`configs/dna_margin_mse.json`](../configs/dna_margin_mse.json)。
 
-训练、验证、恢复和显式测试评估脚本已经提供。当前没有加载服务器真实权重或完成 L40S 全长训练验证；下述数值是首轮工作默认值，并非已经验证的最优参数。小型合成模型测试验证软件行为，不构成生物学效果或真实 GPU 资源结论。
+训练、验证、恢复和显式测试评估脚本已经提供。服务器原始 checkpoint 已通过 LoRA/BF16/FA2 的完整 DNA 资源探测，最长训练样本为 231,984 bp / 52,424 tokens；此前双重重算配置下峰值已分配显存为 3.66 GiB。2026-11-26 用户反馈 frozen/head 运行正常，但 LoRA 两小时后仍在第 1 轮 160/908 三元组。下方新增性能配置利用显存减少重算，**尚待服务器增强 probe 验证实际速度和峰值**；已通过的软件测试不构成检索效果结论。
 
 ## 1. 已固定的数据和监督
 
@@ -133,11 +133,61 @@ python scripts/train_dna_encoder.py probe \
   --report-dir runs/dna_probe_lora_s42
 ```
 
-该步骤先完整分词全部训练 BGC，再按**实际输入 token 长度**选中位数、P90 和最长样本。各样本与另外两个训练 BGC 组成探测三元组，执行前向、反向、optimizer update，并验证保存后的可训练状态能在重新加载原始 checkpoint 后恢复输出。探测记录 token 数、用时、CUDA 峰值已分配显存及保存/重载误差；探测更新后的权重不进入正式实验。
+该步骤先完整分词全部训练 BGC，再按**实际输入 token 长度**选中位数、P90 和最长样本。各样本与另外两个训练 BGC 组成探测三元组，并额外将**三条最长 DNA 一起**组成 `longest_triplet` 压力样本，执行前向、反向、optimizer update，最后验证保存重载。自适应重算配置还探测预算内总 tokens 最大的第 0 轮实际三元组 `activation_budget_boundary`。报告记录各成员 tokens、合计长度、实际重算开关、用时、CUDA allocated/reserved 峰值及保存重载误差；探测更新后的权重不进入正式实验。
 
 必须检查 `probe.json` 的 `status`，尤其是最长样本是否成功。当前默认 `gradient_replay=true`：每个三元组先无梯度编码三个 BGC，计算表示层梯度，再恢复各次 RNG 状态，逐个 BGC 重算和反传。每条 DNA 经过两遍编码，LoRA 模式同时启用层级 gradient checkpointing，因此会增加计算量；反传时仅保留一个完整 BGC 的计算图。
 
 这种重算不会将 DNA 切成窗口，也不会把历史 LoRA 向量作为持久训练缓存。它无法解决“单条完整 DNA 本身也装不下”的情况。若 OOM、输入超过显式 `max_tokens` 或任意样本失败，程序写出失败记录并终止，不静默裁剪、切窗、跳过或剔除长序列。需要调整资源协议时，应另建运行目录并记录变化。
+
+### 4.2.1 L40S 性能配置：保留激活，减少重算
+
+新配置为 [`configs/dna_margin_mse_lora_fast.json`](../configs/dna_margin_mse_lora_fast.json)。原配置继续保留；两个配置的损失、数据划分、三元组顺序、学习率、梯度累积数、LoRA 目标和 dropout 均相同，只调整计算与存储策略。
+
+| 项目 | 原 LoRA 配置 | 新性能配置 |
+| --- | --- | --- |
+| `gradient_replay` | `true`，三元组调用 encoder 6 次 | `false`，调用 3 次，保留三个计算图至反传结束 |
+| `gradient_checkpointing` | `true`，所有三元组都重算层 | `true`，由下面的预算决定何时重算 |
+| `checkpoint_token_budget` | `0`，保持静态重算设置 | `30000`，三条输入合计 ≤30,000 tokens 时保留层激活，超过时重算 |
+| 固定输入 | 每次创建 token/mask 张量 | 一次验证并缓存 GPU 张量，全程复用 |
+| 最佳模型验证导出 | 训练结束重新编码 train/validation | 复用所选 checkpoint 当轮的验证向量 |
+
+tokens 预算包括每个 BGC 的 CLS/SEP，只控制是否保存反传需要的中间激活，**不是截断长度**。第 0 轮固定采样中，624/908 个三元组落在 30,000 预算内，合计约占该轮输入 token 工作量的 50%；这不是 GPU 提速比例。30,000 是待实测的资源预算，不能从旧配置的 3.66 GiB 推断完全关闭重算也一定适合 48 GB。层级 checkpoint 本身就是以重算换显存，详情见 [PyTorch 2.6 文档](https://docs.pytorch.org/docs/2.6/checkpoint.html)。
+
+另一个已修正的开销来自梯度检查：原先每个三元组和更新前分别对约 89 个可训练张量进行 Python 布尔判断，逐个等待 GPU。现在在设备端合并有限性结果，正常路径每个设备只同步一次；发现非有限值仍在 optimizer 更新前终止，并报告具体参数名。[PyTorch 同步开销说明](https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html#avoid-unnecessary-cpu-gpu-synchronization)。
+
+可以保存的内容及边界：
+
+- **输入 token/mask** 与模型参数无关，908 条训练 DNA 共约 122 MiB；加入 validation 后稍大。每个 BGC 只创建一次设备张量，后续不再逐 token 检查或重复 CPU→GPU 搬运。重载模型时仍核对 tokenizer、形状、device 和未修改状态。
+- **本三元组的计算图／激活** 可保留到本次反传结束，使三个分支都贡献梯度。预算内直接保存，预算外启用层重算；仍逐三元组反传，不会同时保留 8 个三元组的所有图。
+- **最佳 checkpoint 的验证向量** 约 1 MiB，和它的 epoch、权重、数据及协议身份一起存入 `last.pt`/`best.pt`。最终只复用同一最佳模型的结果；显式 `evaluate` 仍独立重算，每轮 LoRA 验证也仍用当时的参数编码全图库。
+- **跨 optimizer update 的 LoRA 训练向量不能复用**，参数更新会让旧向量失效。实际检查发现，每 8 个三元组内部按 BGC ID 去重只节省约 0.9% 编码，且共享一次 dropout 会改变当前训练语义，因此没有采用这种缓存。
+
+在服务器更新代码并激活 `dna_training` 后，先执行：
+
+```bash
+python scripts/train_dna_encoder.py probe \
+  --config configs/dna_margin_mse_lora_fast.json \
+  --report-dir runs/dna_probe_lora_fast_s42
+```
+
+检查整体 `status=passed`，预算边界案例的 `active_gradient_checkpointing=false`、三最长案例为 `true`，以及两者的峰值和耗时。三最长输入合计为 **138,497 tokens**；这比旧 probe 的“一个最长＋两个最短”更接近最坏的训练组合。每项失败仍会终止，报告中的 `active_probe` 标出出错组合；不会在 OOM 后静默改变方案。
+
+如预算边界 OOM，可用较小预算重新 probe，例如 `--checkpoint-token-budget 20000`，并在正式训练使用同一设置。设为 `0` 则所有三元组保留层级重算，但仍关闭第一层 replay。`--no-gradient-checkpointing` 是另一个需单独 probe 的可选实验，不建议仅根据旧显存结果直接用于完整数据。
+
+新 probe 通过后，先运行一个完整 epoch，保持原来的 20 epoch 学习率计划：
+
+```bash
+python scripts/train_dna_encoder.py train \
+  --config configs/dna_margin_mse_lora_fast.json \
+  --output-dir runs/dna_lora_fast_s42 \
+  --stop-after-epochs 1
+```
+
+日志现在分开显示初始验证、训练更新及每轮验证；第一个更新、每 10 个更新和最后一个更新打印实际耗时。`history.json` 新增 `training_seconds`、`validation_seconds`、`mean_update_seconds`、`checkpointed_triplets` 和 reserved 显存峰值。用这些实测项评估提速，不把包含初始验证的总运行时直接除以三元组数。
+
+**旧运行与切换：** 保留原 `runs/dna_lora_s42`，性能配置使用新的输出目录。旧程序只在完整 epoch 边界保存，当前第 1 轮 160/908 的中途进度不能精确续跑。更换本轮代码／资源配置后，旧运行的 `--resume` 会因身份检查拒绝，不能手改保存的配置绕过。已完成的 frozen/head 结果保留，不要求重跑。新运行完成首轮后，用下方正常 `--resume` 继续；探测和训练都不覆盖师兄的原 checkpoint。
+
+本地 Python 3.11 / PyTorch 2.6 CPU 环境下 **116 项测试通过**，涵盖有 dropout 时直接／重算路径的梯度与 RNG 一致性、输入缓存更新边界、自适应重算、最佳验证缓存身份、断点恢复及 probe 失败记录。L40S 的实际速度与显存需要上面的新报告确认。
 
 ### 4.3 运行三个对照
 
@@ -153,12 +203,12 @@ python scripts/train_dna_encoder.py train \
   --output-dir runs/dna_head_s42
 
 python scripts/train_dna_encoder.py train \
-  --config configs/dna_margin_mse.json \
+  --config configs/dna_margin_mse_lora_fast.json \
   --mode lora \
-  --output-dir runs/dna_lora_s42
+  --output-dir runs/dna_lora_fast_s42
 ```
 
-以上命令按顺序独立运行。`frozen` 命令只导出和评估冻结表示，不进行 optimizer update。`head` 和 `lora` 在第 0 轮评估之后训练，每轮使用验证集选择最佳状态；如果训练始终没有改善，最佳 checkpoint 可以保留在第 0 轮。
+以上命令按顺序独立运行；已有 frozen/head 结果可保留，LoRA 性能配置须先通过 4.2.1 的新 probe。若已用 `--stop-after-epochs 1` 启动该 LoRA 目录，下一步使用 `--resume`，不要重新执行首次启动命令。`frozen` 命令只导出和评估冻结表示，不进行 optimizer update。`head` 和 `lora` 在第 0 轮评估之后训练，每轮使用验证集选择最佳状态；如果训练始终没有改善，最佳 checkpoint 可以保留在第 0 轮。
 
 `frozen` 和 `head` 可以缓存带来源哈希的归一化 encoder 原向量；`head` 每次仍使用当前投影头计算表示。`lora` 禁止使用这种脱离梯度的冻结缓存，验证时重新编码当前模型下的训练图库和验证查询。
 
@@ -168,7 +218,7 @@ python scripts/train_dna_encoder.py train \
 
 ```bash
 python scripts/train_dna_encoder.py train \
-  --output-dir runs/dna_lora_s42 \
+  --output-dir runs/dna_lora_fast_s42 \
   --resume
 ```
 
@@ -184,7 +234,7 @@ python scripts/train_dna_encoder.py train \
 
 ```bash
 python scripts/train_dna_encoder.py evaluate \
-  --run-dir runs/dna_lora_s42 \
+  --run-dir runs/dna_lora_fast_s42 \
   --split test
 ```
 
@@ -209,7 +259,7 @@ python scripts/train_dna_encoder.py evaluate \
 | `config.json` | 此次运行实际设置，供恢复使用 |
 | `run.json` | 数据/模型/源码/依赖身份，采样、损失、验证选择规则和参数数目 |
 | `token_lengths.tsv` | 本次训练及验证输入的完整 token 数、DNA 哈希、UNK/模糊碱基统计；不含测试输入 |
-| `history.json` | 第 0 轮和各训练轮的验证指标、训练误差、optimizer 步数、分差覆盖、时间和显存 |
+| `history.json` | 第 0 轮和各训练轮的验证指标、训练误差、optimizer 步数、分差覆盖；分开的训练／验证耗时、更新耗时、实际重算三元组数及显存 |
 | `best.pt` | 验证选择的最佳模型状态，用于评估；恢复训练使用 `last.pt` |
 | `last.pt` | 最近完整 epoch 的恢复状态，与 `best.pt` 的用途不同 |
 | `summary.json` | 是否完成/停在 epoch 边界、最佳轮次和指标、已运行轮次及步数；`test_evaluated=false` |
@@ -222,7 +272,7 @@ python scripts/train_dna_encoder.py evaluate \
 
 检索向量 NPZ 使用四个字段：`query_ids`、`gallery_ids`、`query_embeddings`、`gallery_embeddings`；每一行与对应 ID 数组对齐。可使用 `numpy.load(path, allow_pickle=False)` 读取。逐查询表中的 `top_ids` 是 JSON 列表。
 
-`best.pt`/`last.pt` 保存投影头和 LoRA adapter 等可训练状态，并引用原 checkpoint 的身份，不复制完整冻结 backbone。`last.pt` 还保留最佳可训练状态，可在两次文件写入之间中断后恢复 `best.pt`。重新部署或评估仍需保留原预训练 checkpoint、原 tokenizer/config 和本项目代码；不要只复制一个 `.pt` 文件就删除原权重。
+`best.pt`/`last.pt` 保存投影头和 LoRA adapter 等可训练状态，并引用原 checkpoint 的身份，不复制完整冻结 backbone。`last.pt` 还保留最佳可训练状态和该模型对应的 validation 向量，可在两次文件写入之间中断后恢复 `best.pt`，并避免结束时重复编码。验证向量不是训练缓存，不会用于后续 LoRA 更新。重新部署或评估仍需保留原预训练 checkpoint、原 tokenizer/config 和本项目代码；不要只复制一个 `.pt` 文件就删除原权重。
 
 本地自测可运行：
 

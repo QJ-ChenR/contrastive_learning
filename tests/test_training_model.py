@@ -162,6 +162,99 @@ class TrainingModelTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             encoder.tokenize("acgt")
 
+    def test_prepared_inputs_reuse_storage_and_survive_equivalent_encoder_reload(self):
+        import torch
+        from dna_training.model import load_encoder
+
+        encoder = load_encoder(self.settings())
+        ids = encoder.tokenize("ACGTNACGT")[0]
+        prepared = encoder.prepare_tokens(ids)
+        self.assertEqual(len(prepared), len(ids))
+        self.assertEqual(prepared.input_ids.tolist(), [[1, *ids, 2]])
+        self.assertEqual(prepared.attention_mask.tolist(), [[1] * (len(ids) + 2)])
+        expected = encoder.encode_tokens(ids)
+        with mock.patch.object(encoder, "prepare_tokens", side_effect=AssertionError("inputs were rebuilt")), \
+                mock.patch.object(encoder.backbone, "forward", wraps=encoder.backbone.forward) as forward:
+            for _ in range(2):
+                torch.testing.assert_close(encoder.encode_tokens(prepared), expected, rtol=0, atol=0)
+            for call in forward.call_args_list:
+                self.assertIs(call.kwargs["input_ids"], prepared.input_ids)
+                self.assertIs(call.kwargs["attention_mask"], prepared.attention_mask)
+        reloaded = load_encoder(self.settings())
+        torch.testing.assert_close(reloaded.encode_tokens(prepared), expected, rtol=0, atol=0)
+        with torch.inference_mode():
+            inference_prepared = encoder.prepare_tokens(ids)
+            torch.testing.assert_close(encoder.encode_tokens(inference_prepared), expected, rtol=0, atol=0)
+        self.assertFalse(inference_prepared.input_ids.is_inference())
+
+    def test_prepared_inputs_reject_wrong_identity_shape_device_dtype_or_mutation(self):
+        from dataclasses import replace
+        import torch
+        from dna_training.model import load_encoder
+
+        encoder = load_encoder(self.settings())
+        ids = encoder.tokenize("ACGTNACGT")[0]
+        prepared = encoder.prepare_tokens(ids)
+        for bad, message in (
+            (replace(prepared, tokenizer_identity="different-tokenizer"), "different tokenizer"),
+            (replace(prepared, input_ids=prepared.input_ids[:, :-1]), "truncation"),
+            (replace(prepared, attention_mask=prepared.attention_mask[:, :-1]), "truncation"),
+            (replace(prepared, input_ids=prepared.input_ids.to(torch.int32)), "dtype"),
+            (replace(prepared, input_ids=torch.empty(prepared.input_ids.shape, device="meta", dtype=torch.long)), "device"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                encoder.encode_tokens(bad)
+        limited = load_encoder(self.settings(max_tokens=6))
+        with self.assertRaisesRegex(ValueError, "no truncation"):
+            limited.encode_tokens(prepared)
+        for field in ("input_ids", "attention_mask"):
+            bad = encoder.prepare_tokens(ids)
+            getattr(bad, field)[0, 1] = 0
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "modified"):
+                encoder.encode_tokens(bad)
+
+    def test_prepared_inputs_preserve_lora_dropout_gradients_rng_and_updates(self):
+        import torch
+        from dna_training.engine import backward_triplet, capture_rng, restore_rng, seed_everything
+        from dna_training.model import load_encoder
+
+        encoder = load_encoder(self.settings(mode="lora", lora_dropout=0.35))
+        with torch.no_grad():
+            for name, parameter in encoder.backbone.named_parameters():
+                if "lora_B" in name:
+                    parameter.fill_(0.025)
+        encoder.train()
+        tokens = {key: encoder.tokenize(sequence)[0] for key, sequence in (
+            ("anchor", "AAAAACGTN"), ("first", "CCCCCGTACGT"), ("second", "GGGGGTACT")
+        )}
+        prepared = {key: encoder.prepare_tokens(ids) for key, ids in tokens.items()}
+        seed_everything(189)
+        initial_rng = capture_rng()
+        loss = backward_triplet(encoder, tokens, ("anchor", "first", "second", 0.35), replay=False)
+        gradients = {name: parameter.grad.clone() for name, parameter in encoder.named_parameters()
+                     if parameter.requires_grad and parameter.grad is not None}
+        expected_rng = capture_rng()
+        encoder.zero_grad(set_to_none=True)
+        restore_rng(initial_rng)
+        cached_loss = backward_triplet(encoder, prepared, ("anchor", "first", "second", 0.35), replay=False)
+        self.assertEqual(loss, cached_loss)
+        for name, parameter in encoder.named_parameters():
+            if name in gradients:
+                torch.testing.assert_close(parameter.grad, gradients[name], rtol=0, atol=0)
+        actual_rng = capture_rng()
+        torch.testing.assert_close(actual_rng["torch_cpu"], expected_rng["torch_cpu"], rtol=0, atol=0)
+        # Inputs remain valid after parameters change; the resulting embeddings
+        # must change, proving the cache did not retain encoder outputs.
+        encoder.eval()
+        before = encoder.encode_tokens(prepared["anchor"]).detach()
+        with torch.no_grad():
+            for name, parameter in encoder.backbone.named_parameters():
+                if "lora_B" in name:
+                    parameter.add_(torch.linspace(-0.1, 0.15, parameter.numel()).reshape_as(parameter))
+        after = encoder.encode_tokens(prepared["anchor"]).detach()
+        self.assertFalse(torch.equal(before, after))
+        torch.testing.assert_close(after, encoder.encode_tokens(tokens["anchor"]), rtol=0, atol=0)
+
     def test_head_trains_without_backbone_gradients(self):
         import torch
         from dna_training.model import load_encoder
@@ -177,6 +270,69 @@ class TrainingModelTests(unittest.TestCase):
         self.assertGreater(float(encoder.head.weight.grad.abs().sum()), 0)
         self.assertTrue(all(p.grad is None for p in encoder.backbone.parameters()))
         self.assertEqual(encoder.metadata["embedding_dim"], 7)
+
+    def test_adaptive_checkpoint_budget_switches_only_at_triplet_boundary(self):
+        from dna_training.model import load_encoder
+
+        encoder = load_encoder(self.settings(mode="lora", checkpoint_token_budget=30))
+        self.assertTrue(encoder.gradient_checkpointing)
+        with mock.patch.object(encoder.backbone, "gradient_checkpointing_disable",
+                               wraps=encoder.backbone.gradient_checkpointing_disable) as disable, \
+                mock.patch.object(encoder.backbone, "gradient_checkpointing_enable",
+                                  wraps=encoder.backbone.gradient_checkpointing_enable) as enable:
+            encoder.configure_checkpointing(30)
+            self.assertFalse(encoder.active_gradient_checkpointing)
+            self.assertFalse(encoder.backbone.is_gradient_checkpointing)
+            encoder.configure_checkpointing(20)
+            disable.assert_called_once()
+            encoder.configure_checkpointing(31)
+            self.assertTrue(encoder.active_gradient_checkpointing)
+            self.assertTrue(encoder.backbone.is_gradient_checkpointing)
+            encoder.configure_checkpointing(40)
+            enable.assert_called_once_with(gradient_checkpointing_kwargs={"use_reentrant": False})
+        for enabled in (False, True):
+            static = load_encoder(self.settings(mode="lora", gradient_checkpointing=enabled,
+                                                checkpoint_token_budget=0))
+            for total in (3, 100000):
+                static.configure_checkpointing(total)
+                self.assertEqual(static.active_gradient_checkpointing, enabled)
+        frozen = load_encoder(self.settings(mode="frozen", checkpoint_token_budget=30))
+        frozen.configure_checkpointing(100000)
+        self.assertFalse(frozen.active_gradient_checkpointing)
+
+    def test_adaptive_checkpoint_policy_preserves_dropout_gradients_and_rng(self):
+        import torch
+        from dna_training.engine import backward_triplet, capture_rng, restore_rng, seed_everything
+        from dna_training.model import load_encoder
+
+        reference = load_encoder(self.settings(mode="lora", lora_dropout=0.35,
+                                               checkpoint_token_budget=0))
+        tokens = {key: reference.prepare_tokens(reference.tokenize(sequence)[0]) for key, sequence in (
+            ("anchor", "AAAAACGTN"), ("first", "CCCCCGTACGT"), ("second", "GGGGGTACT")
+        )}
+        total_tokens = sum(len(value) + 2 for value in tokens.values())
+        adaptive = load_encoder(self.settings(mode="lora", lora_dropout=0.35,
+                                              checkpoint_token_budget=total_tokens))
+        with torch.no_grad():
+            for name, parameter in reference.backbone.named_parameters():
+                if "lora_B" in name:
+                    parameter.copy_(torch.linspace(-0.08, 0.09, parameter.numel()).reshape_as(parameter))
+        adaptive.load_trainable_state(reference.trainable_state())
+        seed_everything(189)
+        initial_rng = capture_rng()
+        reference_loss = backward_triplet(reference, tokens, ("anchor", "first", "second", 0.35), replay=False)
+        expected_rng = capture_rng()
+        restore_rng(initial_rng)
+        with mock.patch.object(adaptive, "configure_checkpointing", wraps=adaptive.configure_checkpointing) as configure:
+            actual_loss = backward_triplet(adaptive, tokens, ("anchor", "first", "second", 0.35), replay=False)
+        configure.assert_called_once_with(total_tokens)
+        self.assertTrue(reference.active_gradient_checkpointing)
+        self.assertFalse(adaptive.active_gradient_checkpointing)
+        self.assertAlmostEqual(actual_loss, reference_loss, places=7)
+        for (name, actual), (_, expected) in zip(adaptive.named_parameters(), reference.named_parameters()):
+            if expected.grad is not None:
+                torch.testing.assert_close(actual.grad, expected.grad, atol=2e-6, rtol=2e-5, msg=name)
+        torch.testing.assert_close(capture_rng()["torch_cpu"], expected_rng["torch_cpu"], atol=0, rtol=0)
 
     def test_lora_matches_initial_head_and_updates_adapter_with_checkpointing(self):
         import torch

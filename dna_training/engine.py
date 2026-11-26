@@ -82,9 +82,19 @@ def _margin_loss(vectors: torch.Tensor, target: float) -> torch.Tensor:
 
 
 def _finite_gradients(model) -> None:
+    # Python bool conversion of each CUDA reduction synchronizes the GPU. Keep
+    # the common finite path to one conversion per device, with the original
+    # named diagnostic retained on the exceptional path.
+    checks_by_device = {}
     for name, parameter in model.named_parameters():
-        if parameter.requires_grad and parameter.grad is not None and not torch.isfinite(parameter.grad).all():
-            raise FloatingPointError(f"Non-finite gradient in {name}")
+        if parameter.requires_grad and parameter.grad is not None:
+            finite = torch.isfinite(parameter.grad).all()
+            checks_by_device.setdefault(finite.device, []).append((name, finite))
+    for checks in checks_by_device.values():
+        if not torch.stack([finite for _, finite in checks]).all():
+            for name, finite in checks:
+                if not finite:
+                    raise FloatingPointError(f"Non-finite gradient in {name}")
 
 
 def backward_triplet(
@@ -107,6 +117,11 @@ def backward_triplet(
     if not math.isfinite(target) or not -1 <= target <= 1:
         raise ValueError("The chemical similarity gap must be finite and in [-1, 1]")
     ids = (anchor, first, second)
+    configure_checkpointing = getattr(model, "configure_checkpointing", None)
+    if configure_checkpointing is not None and base_features is None:
+        # One choice covers all forward graphs and their backwards. The total
+        # includes CLS/SEP and is conservative even in sequential replay mode.
+        configure_checkpointing(sum(len(tokens[bgc_id]) + 2 for bgc_id in ids))
     if base_features is not None:
         if getattr(model, "mode", None) != "head":
             raise ValueError("Persistent frozen base features are allowed only in head mode")

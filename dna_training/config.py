@@ -32,6 +32,7 @@ class TrainingConfig:
     lora_targets: tuple[str, ...] = ("attn.Wqkv", "attn.Wo")
     gradient_checkpointing: bool = True
     gradient_replay: bool = True
+    checkpoint_token_budget: int = 0
     max_tokens: int | None = None
     max_epochs: int = 20
     patience: int = 4
@@ -89,6 +90,9 @@ class TrainingConfig:
         for name in ("gradient_checkpointing", "gradient_replay"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be boolean")
+        if (isinstance(self.checkpoint_token_budget, bool)
+                or not isinstance(self.checkpoint_token_budget, int) or self.checkpoint_token_budget < 0):
+            raise ValueError("checkpoint_token_budget must be a nonnegative integer; zero keeps the configured static behavior")
         for name in ("project_root", "split_dir", "matrix_path", "checkpoint"):
             if not isinstance(getattr(self, name), str):
                 raise ValueError(f"{name} must be a path string")

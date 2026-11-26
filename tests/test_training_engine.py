@@ -3,6 +3,7 @@ import io
 import random
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
@@ -10,7 +11,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from dna_training.engine import (
-    backward_triplet, capture_rng, finish_step, make_optimizer, restore_rng,
+    _finite_gradients, backward_triplet, capture_rng, finish_step, make_optimizer, restore_rng,
     seed_everything, set_learning_rate,
 )
 
@@ -165,6 +166,24 @@ class TrainingEngineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "finite vector") as caught:
             backward_triplet(model, TOKENS, ("a", "b", "c", 0.2))
         self.assertIn("BGC a", " ".join(caught.exception.__notes__))
+
+    def test_finite_gradient_check_has_one_scalar_read_and_keeps_named_error(self):
+        model = TinyEncoder()
+        for parameter in model.parameters():
+            parameter.grad = torch.ones_like(parameter)
+        original_bool = torch.Tensor.__bool__
+        scalar_reads = []
+
+        def count_scalar_reads(value):
+            scalar_reads.append(value.numel())
+            return original_bool(value)
+
+        with mock.patch.object(torch.Tensor, "__bool__", count_scalar_reads):
+            _finite_gradients(model)
+        self.assertEqual(scalar_reads, [1])
+        model.head.weight.grad[0, 0] = float("inf")
+        with self.assertRaisesRegex(FloatingPointError, "Non-finite gradient in head.weight"):
+            _finite_gradients(model)
 
     def test_invalid_triplets_and_scales_rejected(self):
         model = TinyEncoder()

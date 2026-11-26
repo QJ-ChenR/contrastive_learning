@@ -4,7 +4,7 @@
 
 创建日期：2026-11-20（Europe/Paris）。
 
-**当前状态：已完成 DNA 近同源分组、按 BGC／组划分及连续差值监督训练脚本；尚未在真实服务器 checkpoint 上训练。** 最新入口：[训练与服务器运行指南](docs/dna-training.md)、[划分结果](data/processed/dna_homology_split_v1/summary.md)、[分组规则与复现](docs/homology-split.md)。原始数据、[初始清单快照](data/processed/benchmark_manifest_v1/summary.md)及全部产物关系保留。
+**当前状态：已完成 DNA 近同源分组、按 BGC／组划分及连续差值监督训练脚本；服务器真实 checkpoint 已通过全长 LoRA 资源探测。** 用户反馈 frozen/head 运行正常，LoRA 训练耗时较长；现提供[利用显存减少重算的配置与探测步骤](docs/dna-training.md#421-l40s-性能配置保留激活减少重算)，实际提速待服务器验证。最新入口：[训练指南](docs/dna-training.md)、[划分结果](data/processed/dna_homology_split_v1/summary.md)、[分组规则与复现](docs/homology-split.md)。原始数据、[初始清单快照](data/processed/benchmark_manifest_v1/summary.md)及全部产物关系保留。
 
 服务器依赖已统一为 [requirements.txt](requirements.txt)，对应已确认的 Python 3.11 / PyTorch 2.6 nightly / CUDA 12.4 / L40S 环境，补入 PEFT 0.18.1。安装、版本依据与 GPU 检查见[环境指南](docs/server-environment.md)。
 

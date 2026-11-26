@@ -8,6 +8,7 @@ imported: its inference-only execution cannot train encoder adapters.
 from __future__ import annotations
 
 from contextlib import nullcontext
+from dataclasses import dataclass
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -20,6 +21,27 @@ from torch import nn
 
 
 DEFAULT_LORA_TARGETS = ["attn.Wqkv", "attn.Wo"]
+
+
+@dataclass(frozen=True)
+class PreparedDNAInput:
+    """Validated, reusable token tensors; never model activations or embeddings.
+
+    Build these with ``DNAEncoder.prepare_tokens``. They may be reused across
+    parameter updates and equivalent reloaded encoders because only the fixed
+    tokenizer and input policy determine their contents. Treat tensors as
+    read-only; version counters detect accidental in-place edits.
+    """
+
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    content_token_count: int
+    tokenizer_identity: str
+    input_version: int
+    mask_version: int
+
+    def __len__(self) -> int:
+        return self.content_token_count
 
 
 def file_sha256(path: str | Path) -> str:
@@ -142,9 +164,19 @@ class DNAEncoder(nn.Module):
                 corrections[name] = {"config_value": old, "tokenizer_value": token_id}
                 setattr(config, name, token_id)
         self.tokenizer = tokenizer
+        self._tokenizer_identity = sha256(json.dumps({
+            "definition": sha256(tokenizer.backend_tokenizer.to_str().encode("utf-8")).hexdigest(),
+            "vocabulary_size": len(tokenizer),
+            "special_ids": self.special_ids,
+            "mask_token_id": getattr(tokenizer, "mask_token_id", None),
+        }, sort_keys=True).encode("utf-8")).hexdigest()
         backbone.requires_grad_(False)
         backbone.eval()
         self.gradient_checkpointing = bool(settings.get("gradient_checkpointing", True)) and self.mode == "lora"
+        self.checkpoint_token_budget = settings.get("checkpoint_token_budget", 0)
+        if (isinstance(self.checkpoint_token_budget, bool)
+                or not isinstance(self.checkpoint_token_budget, int) or self.checkpoint_token_budget < 0):
+            raise ValueError("checkpoint_token_budget must be a nonnegative integer")
         self.lora_modules: list[str] = []
         self.lora_settings: dict = {}
         if self.mode == "lora":
@@ -184,6 +216,7 @@ class DNAEncoder(nn.Module):
             if not any(parameter.requires_grad for parameter in backbone.parameters()):
                 raise ValueError("LoRA failed to create trainable adapter parameters")
         self.backbone = backbone.to(device=self.device)
+        self.active_gradient_checkpointing = self.gradient_checkpointing
         self.projection_dim = self.hidden_size if self.mode == "frozen" else _positive_int(
             settings.get("projection_dim", 256), "projection_dim"
         )
@@ -208,6 +241,7 @@ class DNAEncoder(nn.Module):
             "projection_seed": self.seed, "dtype": self.dtype_name,
             "attention_backend": self.attention_backend, "device": str(self.device),
             "gradient_checkpointing": self.gradient_checkpointing,
+            "checkpoint_token_budget": self.checkpoint_token_budget,
             "gradient_checkpointing_use_reentrant": False,
             "special_token_ids": self.special_ids,
             "special_id_corrections": corrections,
@@ -227,6 +261,26 @@ class DNAEncoder(nn.Module):
         if self.mode in {"frozen", "head"}:
             self.backbone.eval()
         return self
+
+    def configure_checkpointing(self, total_input_tokens: int) -> None:
+        """Choose one layer-checkpoint policy for the entire upcoming triplet.
+
+        A nonzero budget retains ordinary activations for shorter triplets and
+        recomputes layers for larger ones. Zero preserves the configured static
+        behavior. Never call this between a triplet's forward and backward.
+        """
+        if isinstance(total_input_tokens, bool) or not isinstance(total_input_tokens, int) or total_input_tokens <= 0:
+            raise ValueError("total_input_tokens must be a positive integer")
+        enabled = self.gradient_checkpointing and (
+            self.checkpoint_token_budget == 0 or total_input_tokens > self.checkpoint_token_budget
+        )
+        if enabled == self.active_gradient_checkpointing:
+            return
+        if enabled:
+            self.backbone.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        else:
+            self.backbone.gradient_checkpointing_disable()
+        self.active_gradient_checkpointing = enabled
 
     def _check_length(self, count: int) -> None:
         if count < 1:
@@ -283,7 +337,8 @@ class DNAEncoder(nn.Module):
             "sequence_mode": "full", "window_count": 1,
         }
 
-    def base_tokens(self, ids: list[int]) -> torch.Tensor:
+    def prepare_tokens(self, ids: list[int]) -> PreparedDNAInput:
+        """Validate content IDs once and retain their exact full-device inputs."""
         self._check_length(len(ids))
         prohibited = {self.special_ids[name] for name in ("cls", "sep", "pad")}
         mask_id = getattr(self.tokenizer, "mask_token_id", None)
@@ -292,13 +347,43 @@ class DNAEncoder(nn.Module):
         if any(isinstance(token_id, bool) or not isinstance(token_id, int)
                or not 0 <= token_id < len(self.tokenizer) or token_id in prohibited for token_id in ids):
             raise ValueError("Content IDs contain an invalid or structural token")
-        inputs = torch.tensor(
-            [[self.special_ids["cls"], *ids, self.special_ids["sep"]]],
-            dtype=torch.long, device=self.device,
-        )
+        # Normal tensors retain mutation version counters even when this helper
+        # is called by an inference-only consumer.
+        with torch.inference_mode(False):
+            inputs = torch.tensor(
+                [[self.special_ids["cls"], *ids, self.special_ids["sep"]]],
+                dtype=torch.long, device=self.device,
+            )
+            mask = torch.ones_like(inputs)
+        return PreparedDNAInput(inputs, mask, len(ids), self._tokenizer_identity,
+                                inputs._version, mask._version)
+
+    def _prepared_inputs(self, ids: list[int] | PreparedDNAInput) -> PreparedDNAInput:
+        if not isinstance(ids, PreparedDNAInput):
+            return self.prepare_tokens(ids)
+        self._check_length(len(ids))
+        if ids.tokenizer_identity != self._tokenizer_identity:
+            raise ValueError("Prepared DNA input belongs to a different tokenizer or special-token policy")
+        # Parameter device resolves the CUDA default index without asking the
+        # current global CUDA context or synchronizing a device tensor.
+        expected_device = self.backbone.get_input_embeddings().weight.device
+        expected_shape = (1, len(ids) + 2)
+        for tensor, version in ((ids.input_ids, ids.input_version),
+                                (ids.attention_mask, ids.mask_version)):
+            if tensor.device != expected_device or tensor.dtype != torch.long:
+                raise ValueError("Prepared DNA input has an incompatible device or dtype")
+            if tensor.shape != expected_shape:
+                raise ValueError("Prepared DNA input shape changed; truncation is forbidden")
+            if tensor._version != version:
+                raise ValueError("Prepared DNA input was modified after validation")
+        return ids
+
+    def base_tokens(self, ids: list[int] | PreparedDNAInput) -> torch.Tensor:
+        prepared = self._prepared_inputs(ids)
         context = nullcontext() if self.mode == "lora" else torch.no_grad()
         with context:
-            output = self.backbone(input_ids=inputs, attention_mask=torch.ones_like(inputs), return_dict=True)
+            output = self.backbone(input_ids=prepared.input_ids,
+                                   attention_mask=prepared.attention_mask, return_dict=True)
             hidden = output.last_hidden_state
             if hidden.shape != (1, len(ids) + 2, self.hidden_size):
                 raise ValueError("Unexpected ModernBERT hidden-state shape")
@@ -312,7 +397,7 @@ class DNAEncoder(nn.Module):
             raise ValueError("Projection expects one or a batch of normalized base vectors")
         return _unit(self.head(base.to(device=self.device, dtype=torch.float32)), "Projected DNA vector")
 
-    def encode_tokens(self, ids: list[int]) -> torch.Tensor:
+    def encode_tokens(self, ids: list[int] | PreparedDNAInput) -> torch.Tensor:
         return self.project(self.base_tokens(ids))
 
     def _state_identity(self) -> dict:

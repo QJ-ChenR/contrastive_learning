@@ -66,6 +66,16 @@ def tokenize_ids(model, cohort, ids, output=None):
     return tokens, rows
 
 
+def prepare_token_inputs(model, tokens):
+    """Cache only validated IDs/masks, never parameter-dependent representations."""
+    prepared = {key: model.prepare_tokens(ids) for key, ids in tokens.items()}
+    byte_count = sum(value.input_ids.numel() * value.input_ids.element_size()
+                     + value.attention_mask.numel() * value.attention_mask.element_size()
+                     for value in prepared.values())
+    print(f"Prepared {len(prepared)} DNA inputs on {model.device}: {byte_count / 2**20:.1f} MiB", flush=True)
+    return prepared
+
+
 def _signature(config, cohort, model):
     # Paths are operational, not model/data identity. Hashes permit moving the
     # project and original checkpoint together without changing the experiment.
@@ -173,7 +183,15 @@ def encode_ids(model, tokens, ids, base_features=None):
     return np.asarray(vectors, dtype=np.float32)
 
 
-def evaluate_model(model, cohort, tokens, split, k, base_features=None, export_dir=None):
+def _export_evaluation(output, metrics, embeddings):
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    np.savez(output / "embeddings.npz", **embeddings)
+    write_json(output / "metrics.json", metrics)
+    write_tsv(output / "per_query.tsv", metrics["per_query"])
+
+
+def evaluate_model(model, cohort, tokens, split, k, base_features=None, export_dir=None, *, return_embeddings=False):
     query_ids, gallery_ids = cohort.ids_by_split[split], cohort.ids_by_split["train"]
     # Every validation pass re-encodes the gallery with the current LoRA model.
     # A frozen backbone may reuse ONLY its pre-projection vectors.
@@ -181,17 +199,82 @@ def evaluate_model(model, cohort, tokens, split, k, base_features=None, export_d
     queries = encode_ids(model, tokens, query_ids, base_features)
     metrics = retrieval_metrics(query_ids, gallery_ids, queries, gallery,
                                 cohort.scores(query_ids, gallery_ids), k=k)
+    embeddings = {"query_ids": np.asarray(query_ids), "gallery_ids": np.asarray(gallery_ids),
+                  "query_embeddings": queries, "gallery_embeddings": gallery}
     if export_dir is not None:
-        output = Path(export_dir)
-        output.mkdir(parents=True, exist_ok=True)
-        np.savez(output / "embeddings.npz", query_ids=np.asarray(query_ids), gallery_ids=np.asarray(gallery_ids),
-                 query_embeddings=queries, gallery_embeddings=gallery)
-        write_json(output / "metrics.json", metrics)
-        write_tsv(output / "per_query.tsv", metrics["per_query"])
+        _export_evaluation(export_dir, metrics, embeddings)
+    return (metrics, embeddings) if return_embeddings else metrics
+
+
+def _state_hash(state):
+    """Hash small CPU adapter/head states, without serializing frozen weights."""
+    import torch
+    digest = hashlib.sha256(json.dumps(state["identity"], sort_keys=True).encode())
+    for kind in ("head", "adapters"):
+        for name, value in sorted(state[kind].items()):
+            value = value.detach().cpu().contiguous()
+            digest.update(json.dumps([kind, name, str(value.dtype), list(value.shape)]).encode())
+            digest.update(value.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _validation_snapshot(embeddings, epoch, signature, model_state):
+    """Keep an exact selected-checkpoint evaluation in the atomic checkpoint.
+
+    CPU tensors stay compatible with torch.load(weights_only=True). They are
+    only reused for exporting that same checkpoint's validation, never training.
+    """
+    import torch
+    return {
+        "schema": "dna_validation_snapshot_v1", "epoch": epoch,
+        "signature_sha256": hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest(),
+        "model_sha256": _state_hash(model_state),
+        "query_ids": embeddings["query_ids"].tolist(), "gallery_ids": embeddings["gallery_ids"].tolist(),
+        "query_embeddings": torch.from_numpy(embeddings["query_embeddings"].copy()),
+        "gallery_embeddings": torch.from_numpy(embeddings["gallery_embeddings"].copy()),
+        "embeddings_sha256": {
+            key: hashlib.sha256(embeddings[key].tobytes()).hexdigest()
+            for key in ("query_embeddings", "gallery_embeddings")
+        },
+    }
+
+
+def _export_selected_validation(selected, cohort, k, output):
+    """Return None for old checkpoints; reject a present but mismatched cache."""
+    snapshot = selected.get("best_validation")
+    if snapshot is None:
+        return None
+    expected_signature = hashlib.sha256(json.dumps(selected["signature"], sort_keys=True).encode()).hexdigest()
+    if (snapshot.get("schema") != "dna_validation_snapshot_v1"
+            or cohort.fingerprint != selected["signature"]["input"]
+            or k != selected["signature"]["settings"]["eval_k"]
+            or snapshot["epoch"] != selected["epoch"]
+            or snapshot["signature_sha256"] != expected_signature
+            or snapshot["model_sha256"] != _state_hash(selected["model"])
+            or snapshot["query_ids"] != cohort.ids_by_split["validation"]
+            or snapshot["gallery_ids"] != cohort.ids_by_split["train"]):
+        raise ValueError("Selected validation cache identity mismatch")
+    embeddings = {key: np.asarray(snapshot[key]) for key in ("query_ids", "gallery_ids")}
+    width = selected["model"]["identity"]["embedding_dim"]
+    for kind in ("query", "gallery"):
+        key = f"{kind}_embeddings"
+        value = snapshot[key].detach().cpu().numpy()
+        if (value.dtype != np.float32 or value.shape != (len(embeddings[f"{kind}_ids"]), width)
+                or not np.isfinite(value).all()
+                or hashlib.sha256(value.tobytes()).hexdigest() != snapshot["embeddings_sha256"][key]):
+            raise ValueError("Selected validation cache shape/content mismatch")
+        embeddings[key] = value
+    metrics = retrieval_metrics(snapshot["query_ids"], snapshot["gallery_ids"],
+                                embeddings["query_embeddings"], embeddings["gallery_embeddings"],
+                                cohort.scores(snapshot["query_ids"], snapshot["gallery_ids"]), k=k)
+    if metrics["aggregate"]["ndcg_at_k"] != selected["best_score"]:
+        raise ValueError("Selected validation cache score differs from checkpoint")
+    _export_evaluation(output, metrics, embeddings)
     return metrics
 
 
-def _checkpoint(model, optimizer, signature, config, epoch, step, best_score, best_epoch, stale, history, best_model):
+def _checkpoint(model, optimizer, signature, config, epoch, step, best_score, best_epoch, stale, history, best_model,
+                best_validation=None):
     from .engine import capture_rng
     return {
         "schema": "dna_training_v1", "config": config.to_dict(), "signature": signature,
@@ -199,6 +282,7 @@ def _checkpoint(model, optimizer, signature, config, epoch, step, best_score, be
         "rng": capture_rng(), "epoch": epoch, "optimizer_step": step,
         "best_score": best_score, "best_epoch": best_epoch, "stale_epochs": stale, "history": history,
         "best_model": best_model,
+        "best_validation": best_validation,
     }
 
 
@@ -252,9 +336,12 @@ def train(config: TrainingConfig, resume=False, stop_after_epochs=None):
                     "selection": f"validation_vs_train_gallery_ndcg@{config.eval_k}_gain_S",
                     "test_used_for_training_or_selection": False,
                     "gradient_replay": config.gradient_replay,
+                    "input_cache": "validated_token_ids_and_masks_on_device",
+                    "validation_cache": "selected_checkpoint_only_in_last_and_best",
                 })
             ids = cohort.ids_by_split["train"] + cohort.ids_by_split["validation"]
             tokens, _ = tokenize_ids(model, cohort, ids, output / "token_lengths.tsv")
+            tokens = prepare_token_inputs(model, tokens)
             features = _base_cache(model, tokens, ids, output, signature) if config.mode != "lora" else None
             optimizer = make_optimizer(model, config) if config.mode != "frozen" else None
             if state is not None:
@@ -265,16 +352,23 @@ def train(config: TrainingConfig, resume=False, stop_after_epochs=None):
                 start_epoch, step = state["epoch"] + 1, state["optimizer_step"]
                 best_score, best_epoch, stale = state["best_score"], state["best_epoch"], state["stale_epochs"]
                 best_model = state["best_model"]
+                best_validation = state.get("best_validation")
             else:
-                initial = evaluate_model(model, cohort, tokens, "validation", config.eval_k, features)
+                print("Initial validation: encoding current gallery and queries", flush=True)
+                validation_started = time.monotonic()
+                initial, embeddings = evaluate_model(model, cohort, tokens, "validation", config.eval_k, features,
+                                                     return_embeddings=True)
                 best_score = initial["aggregate"]["ndcg_at_k"]
                 if best_score is None or not math.isfinite(best_score):
                     raise ValueError("Validation has no defined nDCG; cannot select a checkpoint")
                 history = [{"epoch": 0, "train_loss": None, "optimizer_step": 0,
+                            "validation_seconds": time.monotonic() - validation_started,
                             "validation": initial["aggregate"]}]
                 best_epoch, stale, start_epoch, step = 0, 0, 1, 0
                 best_model = model.trainable_state()
-                initial_state = _checkpoint(model, optimizer, signature, config, 0, 0, best_score, 0, 0, history, best_model)
+                best_validation = _validation_snapshot(embeddings, 0, signature, best_model)
+                initial_state = _checkpoint(model, optimizer, signature, config, 0, 0, best_score, 0, 0, history,
+                                            best_model, best_validation)
                 _atomic_torch_save(output / "last.pt", initial_state)
                 _write_best(output, initial_state)
                 write_json(output / "history.json", history)
@@ -286,25 +380,38 @@ def train(config: TrainingConfig, resume=False, stop_after_epochs=None):
             if optimizer is not None and stale < config.patience:
                 for epoch in range(start_epoch, config.max_epochs + 1):
                     started = time.monotonic()
+                    print(f"Epoch {epoch}: starting training updates", flush=True)
                     model.train()
                     optimizer.zero_grad(set_to_none=True)
                     triplets = sampler.epoch(epoch - 1)
-                    losses, gradient_norms = [], []
+                    losses, gradient_norms, step_seconds = [], [], []
+                    checkpointed_triplets = 0
                     if model.device.type == "cuda":
                         torch.cuda.reset_peak_memory_stats(model.device)
                     for offset in range(0, len(triplets), config.triplets_per_update):
+                        step_started = time.monotonic()
                         batch = triplets[offset:offset + config.triplets_per_update]
                         set_learning_rate(optimizer, step, total_steps, config.warmup_ratio)
                         for triplet in batch:
                             losses.append(backward_triplet(model, tokens, triplet, divisor=len(batch),
                                                            replay=config.gradient_replay, base_features=features))
+                            checkpointed_triplets += int(getattr(model, "active_gradient_checkpointing", False))
                         gradient_norms.append(finish_step(model, optimizer, config.max_grad_norm))
+                        step_seconds.append(time.monotonic() - step_started)
                         step += 1
-                        if step % 10 == 0:
+                        if offset == 0 or step % 10 == 0 or offset + len(batch) == len(triplets):
                             print(f"Epoch {epoch}: {min(offset + len(batch), len(triplets))}/{len(triplets)} "
-                                  f"triplets, step={step}, loss={np.mean(losses):.6f}", flush=True)
+                                  f"triplets, step={step}, loss={np.mean(losses):.6f}, "
+                                  f"last_update_seconds={step_seconds[-1]:.2f}, "
+                                  f"training_elapsed_seconds={time.monotonic() - started:.1f}", flush=True)
+                    training_seconds = time.monotonic() - started
                     peak = torch.cuda.max_memory_allocated(model.device) if model.device.type == "cuda" else None
-                    metrics = evaluate_model(model, cohort, tokens, "validation", config.eval_k, features)
+                    reserved = torch.cuda.max_memory_reserved(model.device) if model.device.type == "cuda" else None
+                    print(f"Epoch {epoch}: training finished in {training_seconds:.1f}s; starting validation", flush=True)
+                    validation_started = time.monotonic()
+                    metrics, embeddings = evaluate_model(model, cohort, tokens, "validation", config.eval_k, features,
+                                                         return_embeddings=True)
+                    validation_seconds = time.monotonic() - validation_started
                     score = metrics["aggregate"]["ndcg_at_k"]
                     if score is None or not math.isfinite(score):
                         raise ValueError("Non-finite/undefined validation selection metric")
@@ -312,6 +419,7 @@ def train(config: TrainingConfig, resume=False, stop_after_epochs=None):
                     if improved:
                         best_score, best_epoch, stale = score, epoch, 0
                         best_model = model.trainable_state()
+                        best_validation = _validation_snapshot(embeddings, epoch, signature, best_model)
                     else:
                         stale += 1
                     row = {
@@ -320,11 +428,17 @@ def train(config: TrainingConfig, resume=False, stop_after_epochs=None):
                         "mean_absolute_target_gap": float(np.mean([abs(triplet[3]) for triplet in triplets])),
                         "mean_gradient_norm": float(np.mean(gradient_norms)),
                         "training_peak_cuda_allocated_bytes": peak,
+                        "training_peak_cuda_reserved_bytes": reserved,
+                        "training_seconds": training_seconds, "validation_seconds": validation_seconds,
+                        "mean_update_seconds": float(np.mean(step_seconds)),
+                        "training_triplets_per_second": len(triplets) / max(training_seconds, 1e-9),
+                        "checkpointed_triplets": checkpointed_triplets,
                         "epoch_seconds_including_validation": time.monotonic() - started,
                         "validation": metrics["aggregate"], "selected": improved,
                     }
                     history.append(row)
-                    saved = _checkpoint(model, optimizer, signature, config, epoch, step, best_score, best_epoch, stale, history, best_model)
+                    saved = _checkpoint(model, optimizer, signature, config, epoch, step, best_score, best_epoch, stale,
+                                        history, best_model, best_validation)
                     _atomic_torch_save(output / "last.pt", saved)
                     if improved:
                         _write_best(output, saved)
@@ -338,15 +452,21 @@ def train(config: TrainingConfig, resume=False, stop_after_epochs=None):
                         interrupted = True
                         break
             selected = load_state(output / "best.pt")
-            model.load_trainable_state(selected["model"])
-            best_metrics = evaluate_model(model, cohort, tokens, "validation", config.eval_k, features,
-                                          output / "validation")
+            best_metrics = _export_selected_validation(selected, cohort, config.eval_k, output / "validation")
+            reused_validation = best_metrics is not None
+            if best_metrics is None:
+                model.load_trainable_state(selected["model"])
+                best_metrics = evaluate_model(model, cohort, tokens, "validation", config.eval_k, features,
+                                              output / "validation")
+            else:
+                print(f"Exported cached validation for best epoch {selected['epoch']}; no encoder recomputation", flush=True)
             summary = {
                 "status": "interrupted_at_epoch_boundary" if interrupted else "completed",
                 "mode": config.mode, "seed": config.seed, "best_epoch": selected["epoch"],
                 "completed_epochs": history[-1]["epoch"], "optimizer_steps": step,
                 "best_validation": best_metrics["aggregate"], "test_evaluated": False,
                 "best_checkpoint": "best.pt", "resume_checkpoint": "last.pt",
+                "reused_best_validation": reused_validation,
             }
             write_json(output / "summary.json", summary)
             (output / "failure.json").unlink(missing_ok=True)
@@ -389,6 +509,7 @@ def evaluate_run(run_dir, split="validation", overrides=None):
         model.load_trainable_state(saved["model"])
         ids = cohort.ids_by_split["train"] + cohort.ids_by_split[split]
         tokens, _ = tokenize_ids(model, cohort, ids)
+        tokens = prepare_token_inputs(model, tokens)
         destination = run_dir / f"evaluation_{split}"
         metrics = evaluate_model(model, cohort, tokens, split, config.eval_k, export_dir=destination)
         write_json(destination / "provenance.json", {
@@ -402,8 +523,8 @@ def evaluate_run(run_dir, split="validation", overrides=None):
 def probe(config, destination):
     """Measure full-length forward/backward/optimizer/save-reload on train only.
 
-    The median, P90 and longest tokenized training examples are probed without
-    dropping any length stratum. No probe weights enter a training run.
+    Probe median/P90/longest anchors and the three longest distinct inputs
+    together. No probe weights enter a training run.
     """
     import torch
     from .engine import backward_triplet, finish_step, make_optimizer, seed_everything
@@ -412,7 +533,14 @@ def probe(config, destination):
     destination.mkdir(parents=True, exist_ok=True)
     rows = []
     report = {"status": "running", "config": config.to_dict(), "probes": rows,
-              "input_policy": "full DNA; failure is fatal; no length exclusion or truncation"}
+              "input_policy": "full DNA; failure is fatal; no length exclusion or truncation",
+              "resource_settings": {
+                  "gradient_replay": config.gradient_replay,
+                  "gradient_checkpointing": config.gradient_checkpointing,
+                  "checkpoint_token_budget": config.checkpoint_token_budget,
+                  "dtype": config.dtype, "attention_backend": config.attention_backend,
+                  "encoder_forward_count_scope": "encode_tokens calls; excludes internal layer checkpoint recomputation",
+              }}
     write_json(destination / "probe.json", report)
     try:
         config.validate()
@@ -420,40 +548,87 @@ def probe(config, destination):
         cohort = cohort_for(config)
         model = load_encoder(config.model_settings())
         report.update(model=model.metadata, input_fingerprint=cohort.fingerprint)
+        report["device"] = {
+            "type": model.device.type, "name": torch.cuda.get_device_name(model.device)
+            if model.device.type == "cuda" else str(model.device),
+            "total_memory_bytes": torch.cuda.get_device_properties(model.device).total_memory
+            if model.device.type == "cuda" else None,
+        }
         train_ids = cohort.ids_by_split["train"]
         tokens, _ = tokenize_ids(model, cohort, train_ids, destination / "train_token_lengths.tsv")
+        tokens = {key: model.prepare_tokens(value) for key, value in tokens.items()}
+        report["input_tensor_cache"] = {
+            "count": len(tokens), "device": str(model.device),
+            "bytes": sum(value.input_ids.numel() * value.input_ids.element_size()
+                         + value.attention_mask.numel() * value.attention_mask.element_size()
+                         for value in tokens.values()),
+            "contents": "fixed token IDs and attention masks only; no cached LoRA representations",
+        }
         order = sorted(train_ids, key=lambda key: (len(tokens[key]), key))
-        selected = list(dict.fromkeys(order[round((len(order) - 1) * q)] for q in (0.5, 0.9, 1.0)))
-        optimizer = make_optimizer(model, config) if config.mode != "frozen" else None
-        for anchor in selected:
+        if len(order) < 3:
+            raise ValueError("A resource probe requires at least three distinct training BGCs")
+        cases = []
+        for label, quantile in (("median", 0.5), ("p90", 0.9), ("longest", 1.0)):
+            anchor = order[round((len(order) - 1) * quantile)]
             others = [key for key in order if key != anchor][:2]
-            scores = cohort.scores([anchor], others)[0]
-            triplet = (anchor, others[0], others[1], float(scores[0] - scores[1]))
+            cases.append((label, (anchor, *others)))
+        if config.mode == "lora" and config.gradient_checkpointing and config.checkpoint_token_budget > 0:
+            eligible = [triplet for triplet in sampler_for(cohort, config.seed).epoch(0)
+                        if sum(len(tokens[key]) + 2 for key in triplet[:3]) <= config.checkpoint_token_budget]
+            report["activation_budget_boundary"] = {
+                "source": "epoch_0_training_sampler", "eligible_triplets": len(eligible),
+                "status": "included" if eligible else "no_sample_within_budget",
+            }
+            if eligible:
+                boundary = max(eligible, key=lambda triplet: (
+                    sum(len(tokens[key]) + 2 for key in triplet[:3]), triplet[:3],
+                ))
+                cases.append(("activation_budget_boundary", tuple(boundary[:3])))
+        cases.append(("longest_triplet", tuple(reversed(order[-3:]))))
+        optimizer = make_optimizer(model, config) if config.mode != "frozen" else None
+        for label, members in cases:
+            anchor, first, second = members
+            scores = cohort.scores([anchor], [first, second])[0]
+            triplet = (*members, float(scores[0] - scores[1]))
+            lengths = [len(tokens[key]) + 2 for key in members]
+            case = {"case": label, "anchor": anchor,
+                    "base_count": int(cohort.records[anchor]["dna_length_bp"]),
+                    "input_tokens": lengths[0], "triplet": list(members),
+                    "triplet_input_tokens": lengths, "triplet_total_input_tokens": sum(lengths)}
+            report["active_probe"] = case
+            write_json(destination / "probe.json", report)
             if model.device.type == "cuda":
                 torch.cuda.synchronize(model.device)
                 torch.cuda.reset_peak_memory_stats(model.device)
             started = time.monotonic()
             if optimizer is None:
                 model.eval()
+                forward_ids = members if label == "longest_triplet" else (anchor,)
                 with torch.no_grad():
-                    model.encode_tokens(tokens[anchor])
+                    for key in forward_ids:
+                        model.encode_tokens(tokens[key])
                 loss, norm = None, None
+                forward_calls = len(forward_ids)
             else:
                 model.train()
                 optimizer.zero_grad(set_to_none=True)
                 loss = backward_triplet(model, tokens, triplet, replay=config.gradient_replay)
                 norm = finish_step(model, optimizer, config.max_grad_norm)
+                forward_calls = 6 if config.gradient_replay else 3
             if model.device.type == "cuda":
                 torch.cuda.synchronize(model.device)
-            rows.append({"anchor": anchor, "base_count": int(cohort.records[anchor]["dna_length_bp"]),
-                         "input_tokens": len(tokens[anchor]) + 2, "triplet": list(triplet[:3]),
+            rows.append({**case, "encoder_forward_calls": forward_calls,
+                         "active_gradient_checkpointing": model.active_gradient_checkpointing,
                          "loss": loss, "gradient_norm": norm, "seconds": time.monotonic() - started,
                          "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(model.device)
+                         if model.device.type == "cuda" else None,
+                         "peak_cuda_reserved_bytes": torch.cuda.max_memory_reserved(model.device)
                          if model.device.type == "cuda" else None})
+            report.pop("active_probe")
             write_json(destination / "probe.json", report)
-            print(f"Probed {anchor}: {len(tokens[anchor]) + 2} full input tokens", flush=True)
+            print(f"Probed {label} {anchor}: {lengths} full input tokens", flush=True)
         model.eval()
-        check_ids = tokens[selected[0]]
+        check_ids = tokens[cases[0][1][0]]
         with torch.no_grad():
             expected = model.encode_tokens(check_ids).detach().cpu()
         saved = model.trainable_state()

@@ -24,6 +24,21 @@ def _common(parser, *, evaluation=False):
     parser.add_argument("--attention-backend", choices=("eager", "sdpa", "flash_attention_2"))
 
 
+def _training_resources(parser):
+    parser.add_argument(
+        "--gradient-replay", action=argparse.BooleanOptionalAction, default=None,
+        help="Recompute each DNA forward to save memory; --no-gradient-replay retains the triplet graphs",
+    )
+    parser.add_argument(
+        "--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=None,
+        help="Recompute transformer layers during backward; disabling needs a separate memory probe",
+    )
+    parser.add_argument(
+        "--checkpoint-token-budget", type=int,
+        help="Keep activations for triplets within this total-token budget; 0 always uses requested checkpointing",
+    )
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Full-DNA encoder training with continuous chemical similarity gaps")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -32,9 +47,11 @@ def build_parser():
     audit_parser.add_argument("--report", help="Optional JSON report destination")
     probe_parser = commands.add_parser("probe", help="Probe train median/P90/max full-token forward/backward and save/reload")
     _common(probe_parser)
+    _training_resources(probe_parser)
     probe_parser.add_argument("--report-dir", required=True)
     train_parser = commands.add_parser("train", help="Run frozen baseline, head-only, or LoRA; validation only")
     _common(train_parser)
+    _training_resources(train_parser)
     train_parser.add_argument("--resume", action="store_true", help="Restore last.pt from the run directory")
     train_parser.add_argument("--stop-after-epochs", type=int, help="Stop at an epoch boundary, retaining the planned LR schedule")
     evaluate_parser = commands.add_parser("evaluate", help="Evaluate best.pt and export ID-aligned query/gallery vectors")
@@ -55,6 +72,10 @@ def main(argv=None):
     else:
         overrides.update({key: getattr(arguments, key) for key in ("mode", "seed", "output_dir")
                           if getattr(arguments, key) is not None})
+        if arguments.command in {"train", "probe"}:
+            overrides.update({key: getattr(arguments, key) for key in (
+                "gradient_replay", "gradient_checkpointing", "checkpoint_token_budget",
+            ) if getattr(arguments, key) is not None})
         config_path = arguments.config
         if arguments.command == "train" and arguments.resume and config_path is None:
             # Recover the original protocol instead of accidentally resuming
